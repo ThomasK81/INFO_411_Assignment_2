@@ -1,0 +1,55 @@
+using CSV, DataFrames, Plots, StatsBase, Statistics, LinearAlgebra
+
+df_train = CSV.read("mitbih_train.csv", DataFrame, header = false)
+
+describe(df_train)
+
+y = df_train[:, 188]
+df_0 = df_train[df_train.Column188  .==0, :]
+df_1 = df_train[df_train.Column188  .==1, :]
+df_2 = df_train[df_train.Column188  .==2, :]
+df_3 = df_train[df_train.Column188  .==3, :]
+df_4 = df_train[df_train.Column188  .==4, :]
+
+countmap(y)
+
+data = Matrix(df_train)[:, 1:187]
+X = data'
+
+d0 = (Matrix(df_0)[:, 1:187])'
+d1 = (Matrix(df_1)[:, 1:187])'
+d2 = (Matrix(df_2)[:, 1:187])'
+d3 = (Matrix(df_3)[:, 1:187])'
+d4 = (Matrix(df_4)[:, 1:187])'
+
+avg_0 = mean(d0, dims=1)
+avg_1 = mean(d1, dims=1)
+avg_2 = mean(d2, dims=1)
+avg_3 = mean(d3, dims=1)
+avg_4 = mean(d4, dims=1)
+avg = mean(X, dims=1)
+
+plot(plot(avg_0', label="", xlabel="Count", ylabel="ECG Heartbeat", title="Class 0"),
+    plot(avg_1', label="", xlabel="Count", ylabel="ECG Heartbeat", title="Class 1"),
+    plot(avg_2', label="", xlabel="Count", ylabel="ECG Heartbeat", title="Class 2"),
+    plot(avg_3', label="", xlabel="Count", ylabel="ECG Heartbeat", title="Class 3"),
+    plot(avg_4', label="", xlabel="Count", ylabel="ECG Heartbeat", title="Class 4"),
+    plot(avg', label="", xlabel="Count", ylabel="ECG Heartbeat", title="Class All"), layout=6)
+    
+# PCA
+m = mean(X, dims=2)
+R = (X .- m)*(X .- m)'/size(X)[2]
+eigvals(R)
+evecs = eigvecs(R) 
+reverse!(evecs, dims=2) 
+proj = evecs[:, 1:2]' * (X .- m)
+scatter(proj[1,:], proj[2,:], group=y, legendtitle="Classes", xlabel="1st PC", ylabel="2nd PC")
+
+# Standardization PCA
+X1 = standardize(ZScoreTransform, X, dims=2)
+m1 = mean(X1, dims=2)
+R = (X1.-m1) * (X1.-m1)'/size(X1)[2]
+evecs = eigvecs(R) 
+reverse!(evecs, dims=2)
+proj = evecs[:, 1:2]' * X1
+scatter(proj[1,:], proj[2,:], group = y, legendtitle="Classes", xlabel="1st PC", ylabel="2nd PC")
