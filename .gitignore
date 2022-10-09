@@ -1,6 +1,7 @@
 # Mac files
 
 .DS_Store
+.Rhistory
 
 # things not to share
 restricted/*
