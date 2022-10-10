@@ -7,6 +7,7 @@ library(keras)
 library(tensorflow)
 library(tfdatasets)
 library(tidymodels)
+library(themis)
 
 # Test whether GPU is accessible ------------------------------------------
 
@@ -171,13 +172,34 @@ xboost_result %>%
 # cnn ---------------------------------------------------------------------
 
 training_tbl <- here("data", "mitbih_train.csv") %>%
-  read_csv(col_names = F) 
+  read_csv(col_names = F) %>%
+  mutate(X188 = as.factor(X188))
 
-training_tbl_shuffled <- training_tbl %>%
-  slice(sample(1:nrow(training_tbl), nrow(training_tbl)))
-  
 test_tbl <- here("data", "mitbih_test.csv") %>%
-  read_csv(col_names = F)
+  read_csv(col_names = F) %>%
+  mutate(X188 = as.factor(X188))
+
+
+# shuffle and rebalance ---------------------------------------------------
+
+# see how balanced it is
+training_tbl %>%
+  count(X188)
+
+# rebalance using SMOTE
+# bring the minority levels up to ~25000
+# 35000 / 72471 roughly 0.483
+
+rec <- recipe(X188 ~ ., data = training_tbl) %>%
+  step_smote(X188, over_ratio = 0.483) %>%
+  prep()
+
+training_tbl_b <- rec %>%
+  bake(new_data = NULL)
+
+# now shuffle data
+training_tbl_shuffled <- training_tbl_b %>%
+  slice(sample(1:nrow(training_tbl_b), nrow(training_tbl_b)))
 
 xtrain <- training_tbl_shuffled %>% 
   select(-length(training_tbl)) %>%
@@ -220,15 +242,14 @@ cnn_model
 # Compile model
 cnn_model %>% compile(
   loss = loss_categorical_crossentropy,
-  optimizer = optimizer_adadelta(),
+  optimizer = optimizer_adam(),
   metrics = c('accuracy')
 )
-
 
 # set checkpoints callback ------------------------------------------------
 
 cp_callback <- callback_model_checkpoint(
-  filepath = "class_5/all_checkpoints.ckpt",
+  filepath = "class_5_rebalanced/checkpoint-{epoch:04d}.ckpt",
   save_weights_only = TRUE,
   verbose = 1
 )
@@ -242,10 +263,53 @@ cnn_history <- cnn_model %>% fit(
   callbacks = list(cp_callback)
 )
 
-plot(cnn_history) + theme_minimal()
-cnn_model %>% evaluate(xtest, ytest)
+cnn_history$metrics$val_accuracy %>% max()
+cnn_history$metrics$val_loss %>% min()
+which(cnn_history$metrics$val_loss == cnn_history$metrics$val_loss %>% min())
 
-cnn_pred <- cnn_model %>% 
+plot(cnn_history) + theme_minimal()
+
+tibble(epoch = 20:50, val_loss = cnn_history$metrics$val_loss[20:50]) %>% ggplot(aes(epoch, val_loss)) + geom_point() + geom_smooth(se = F)
+
+# retrieve best -----------------------------------------------------------
+
+# define model structure 
+cnn_model_best <- keras_model_sequential() %>%
+  layer_conv_1d(filters = 32, kernel_size = c(5), activation = 'relu', input_shape = input_shape) %>% 
+  layer_max_pooling_1d(strides = 2, pool_size = c(5)) %>% 
+  layer_dropout(rate = 0.25) %>% 
+  layer_conv_1d(filters = 32, kernel_size = c(5), activation = 'relu', input_shape = input_shape) %>% 
+  layer_max_pooling_1d(strides = 2, pool_size = c(5)) %>% 
+  layer_flatten() %>% 
+  layer_dense(units = 32, activation = 'relu') %>% 
+  layer_dense(units = num_classes, activation = 'softmax')
+
+cnn_model_best
+
+# Compile model
+cnn_model_best %>% compile(
+  loss = loss_categorical_crossentropy,
+  optimizer = optimizer_adam(),
+  metrics = c('accuracy')
+)
+
+cnn_model_best %>% evaluate(xtest, ytest)
+
+test_accuracies <- tibble(epoch = 25:50,
+                          test_acc = map_dbl(epoch, function(x) {
+                            load_model_weights_tf(cnn_model_best, str_c("class_5_rebalanced/checkpoint-",
+                                                                        formatC(x, flag = 0, width = 4),
+                                                                        ".ckpt"))
+                            cnn_model_best %>% evaluate(xtest, ytest) %>% .[2]
+                          }))
+
+test_accuracies %>% ggplot(aes(epoch, test_acc)) + geom_point()
+
+load_model_weights_tf(cnn_model_best, "class_5_rebalanced/checkpoint-0046.ckpt")
+
+cnn_model_best %>% evaluate(xtest, ytest)
+
+cnn_pred <- cnn_model_best %>% 
   predict(xtest) %>%
   k_argmax %>%
   as.array
@@ -259,10 +323,10 @@ sum(cnn_pred != test_tbl$X188)
 test_results <- test_tbl %>%
   select(Class = X188) %>%
   bind_cols(
-    predict(cnn_model, xtest) %>%
+    predict(cnn_model_best, xtest) %>%
       k_argmax %>%
       as.array,
-    predict(cnn_model, xtest)
+    predict(cnn_model_best, xtest)
   ) %>%
   rename(
     Class_predicted = 2,
@@ -282,13 +346,198 @@ test_results %>%
 test_results %>% 
   conf_mat(truth = Class, Class_predicted)
 
+test_results_long <- test_results %>% 
+  conf_mat(truth = Class, Class_predicted) %>%
+  tidy %>%
+  separate(name, into = c("cell", "row", "column")) %>%
+  mutate(across(c(row, column), function(x) {as.integer(x) - 1})) %>%
+  select(-1)
+
+sensitivities <- test_results_long %>%
+  group_by(column) %>%
+  mutate(sensitivity = value / sum(value)) %>%
+  ungroup %>%
+  filter(row == column) %>%
+  select(class = row,
+         sensitivity)
+
 test_results %>% 
   conf_mat(truth = Class, Class_predicted) %>%
   autoplot()
 
+# over and undersample  -------------------------------
+
+rec_both <- recipe(X188 ~ ., data = training_tbl) %>%
+  step_smote(X188, over_ratio = 0.483) %>%
+  step_downsample(X188) %>%
+  prep()
+
+training_tbl_b <- rec_both %>%
+  bake(new_data = NULL)
+
+# now shuffle data
+training_tbl_shuffled <- training_tbl_b %>%
+  slice(sample(1:nrow(training_tbl_b), nrow(training_tbl_b)))
+
+xtrain <- training_tbl_shuffled %>% 
+  select(-length(training_tbl)) %>%
+  as.matrix
+
+ytrain <- training_tbl_shuffled %>% 
+  select(length(training_tbl)) %>%
+  as.matrix 
+
+xtest <- test_tbl %>% 
+  select(-length(training_tbl)) %>%
+  as.matrix
+
+ytest <- test_tbl %>% 
+  select(length(training_tbl)) %>%
+  as.matrix 
+
+batch_size <- 128
+num_classes <- 5
+epochs <- 50
+
+input_shape <- c(187, 1)
+
+ytrain <- to_categorical(ytrain, num_classes)
+ytest <- to_categorical(ytest, num_classes)
+
+# define model structure 
+cnn_model_ou <- keras_model_sequential() %>%
+  layer_conv_1d(filters = 32, kernel_size = c(5), activation = 'relu', input_shape = input_shape) %>% 
+  layer_max_pooling_1d(strides = 2, pool_size = c(5)) %>% 
+  layer_dropout(rate = 0.25) %>% 
+  layer_conv_1d(filters = 32, kernel_size = c(5), activation = 'relu', input_shape = input_shape) %>% 
+  layer_max_pooling_1d(strides = 2, pool_size = c(5)) %>% 
+  layer_flatten() %>% 
+  layer_dense(units = 32, activation = 'relu') %>% 
+  layer_dense(units = num_classes, activation = 'softmax')
+
+cnn_model_ou
+
+# Compile model
+cnn_model_ou %>% compile(
+  loss = loss_categorical_crossentropy,
+  optimizer = optimizer_adam(),
+  metrics = c('accuracy')
+)
+
+# set checkpoints callback ------------------------------------------------
+
+cp_callback <- callback_model_checkpoint(
+  filepath = "class_5_rebalanced_both/checkpoint-{epoch:04d}.ckpt",
+  save_weights_only = TRUE,
+  verbose = 1
+)
+
+# Train model
+cnn_history_ou <- cnn_model_ou %>% fit(
+  xtrain, ytrain,
+  batch_size = batch_size,
+  epochs = epochs,
+  validation_split = 0.2,
+  callbacks = list(cp_callback)
+)
+
+# retrieve best -----------------------------------------------------------
+
+# define model structure 
+cnn_model_best_ou <- keras_model_sequential() %>%
+  layer_conv_1d(filters = 32, kernel_size = c(5), activation = 'relu', input_shape = input_shape) %>% 
+  layer_max_pooling_1d(strides = 2, pool_size = c(5)) %>% 
+  layer_dropout(rate = 0.25) %>% 
+  layer_conv_1d(filters = 32, kernel_size = c(5), activation = 'relu', input_shape = input_shape) %>% 
+  layer_max_pooling_1d(strides = 2, pool_size = c(5)) %>% 
+  layer_flatten() %>% 
+  layer_dense(units = 32, activation = 'relu') %>% 
+  layer_dense(units = num_classes, activation = 'softmax')
+
+cnn_model_best_ou
+
+# Compile model
+cnn_model_best_ou %>% compile(
+  loss = loss_categorical_crossentropy,
+  optimizer = optimizer_adam(),
+  metrics = c('accuracy')
+)
+
+cnn_model_best_ou %>% evaluate(xtest, ytest)
+
+which(cnn_history_ou$metrics$val_loss == min(cnn_history_ou$metrics$val_loss))
+
+load_model_weights_tf(cnn_model_best_ou, "class_5_rebalanced_both/checkpoint-0050.ckpt")
+
+cnn_model_best_ou %>% evaluate(xtest, ytest)
+
+cnn_pred <- cnn_model_best_ou %>% 
+  predict(xtest) %>%
+  k_argmax %>%
+  as.array
+
+head(cnn_pred, n=50)
+sum(cnn_pred != test_tbl$X188)
+
+
+# results -----------------------------------------------------------------
+
+test_results <- test_tbl %>%
+  select(Class = X188) %>%
+  bind_cols(
+    predict(cnn_model_best_ou, xtest) %>%
+      k_argmax %>%
+      as.array,
+    predict(cnn_model_best_ou, xtest)
+  ) %>%
+  rename(
+    Class_predicted = 2,
+    prob_0 = 3,
+    prob_1 = 4,
+    prob_2 = 5,
+    prob_3 = 6,
+    prob_4 = 7
+  ) %>%
+  mutate(across(contains("Class"), as.factor))
+
+test_results
+
+test_results %>% 
+  accuracy(truth = Class, Class_predicted)
+
+test_results %>% 
+  conf_mat(truth = Class, Class_predicted)
+
+test_results_long <- test_results %>% 
+  conf_mat(truth = Class, Class_predicted) %>%
+  tidy %>%
+  separate(name, into = c("cell", "row", "column")) %>%
+  mutate(across(c(row, column), function(x) {as.integer(x) - 1})) %>%
+  select(-1)
+
+sensitivities_ou <- test_results_long %>%
+  group_by(column) %>%
+  mutate(sensitivity = value / sum(value)) %>%
+  ungroup %>%
+  filter(row == column) %>%
+  select(class = row,
+         sensitivity)
+
+test_results %>% 
+  conf_mat(truth = Class, Class_predicted) %>%
+  autoplot()
+
+
 # make it a three class problem -------------------------------------------
 
-training_tbl_shuffled_3class <- training_tbl_shuffled %>%
+training_tbl <- here("data", "mitbih_train.csv") %>%
+  read_csv(col_names = F)
+
+test_tbl <- here("data", "mitbih_test.csv") %>%
+  read_csv(col_names = F)
+
+training_tbl_shuffled_3class <- training_tbl %>%
+  slice(sample(1:nrow(training_tbl), nrow(training_tbl))) %>%
   mutate(X188 = case_when(X188 %in% c(0,3,4) ~ 0,
                          T ~ X188))
 
@@ -337,7 +586,7 @@ cnn_model_3class
 # Compile model
 cnn_model_3class %>% compile(
   loss = loss_categorical_crossentropy,
-  optimizer = optimizer_adadelta(),
+  optimizer = optimizer_adam(),
   metrics = c('accuracy')
 )
 
@@ -345,7 +594,7 @@ cnn_model_3class %>% compile(
 # set checkpoints callback ------------------------------------------------
 
 cp_callback <- callback_model_checkpoint(
-  filepath = "class_3/all_checkpoints.ckpt",
+  filepath = "class_3/checkpoint-{epoch:04d}.ckpt",
   save_weights_only = TRUE,
   verbose = 1
 )
@@ -373,16 +622,54 @@ cnn_pred <- cnn_model_3class %>%
 head(cnn_pred, n=50)
 sum(cnn_pred != test_tbl_3class$X188)
 
+# select best model -------------------------------------------------------
+
+# define model structure 
+cnn_model_best_3_class <- keras_model_sequential() %>%
+  layer_conv_1d(filters = 32, kernel_size = c(5), activation = 'relu', input_shape = input_shape) %>% 
+  layer_max_pooling_1d(strides = 2, pool_size = c(5)) %>% 
+  layer_dropout(rate = 0.25) %>% 
+  layer_conv_1d(filters = 32, kernel_size = c(5), activation = 'relu', input_shape = input_shape) %>% 
+  layer_max_pooling_1d(strides = 2, pool_size = c(5)) %>% 
+  layer_flatten() %>% 
+  layer_dense(units = 32, activation = 'relu') %>% 
+  layer_dense(units = num_classes, activation = 'softmax')
+
+cnn_model_best_3_class
+
+# Compile model
+cnn_model_best_3_class %>% compile(
+  loss = loss_categorical_crossentropy,
+  optimizer = optimizer_adam(),
+  metrics = c('accuracy')
+)
+
+cnn_model_best_3_class %>% evaluate(xtest, ytest)
+
+which(cnn_3_class_history$metrics$val_loss == min(cnn_3_class_history$metrics$val_loss))
+
+load_model_weights_tf(cnn_model_best_3_class, "class_3/checkpoint-0037.ckpt")
+
+cnn_model_best_3_class %>% evaluate(xtest, ytest)
+
+cnn_pred <- cnn_model_best_3_class %>% 
+  predict(xtest) %>%
+  k_argmax %>%
+  as.array
+
+head(cnn_pred, n=50)
+sum(cnn_pred != test_tbl$X188)
+
 
 # results -----------------------------------------------------------------
 
 test_3_class_results <- test_tbl_3class %>%
   select(Class = X188) %>%
   bind_cols(
-    predict(cnn_model_3class, xtest) %>%
+    predict(cnn_model_best_3_class, xtest) %>%
       k_argmax %>%
       as.array,
-    predict(cnn_model_3class, xtest)
+    predict(cnn_model_best_3_class, xtest)
   ) %>%
   rename(
     Class_predicted = 2,
@@ -400,4 +687,188 @@ test_3_class_results %>%
 test_3_class_results %>% 
   conf_mat(truth = Class, Class_predicted)
 
+test_results_long <- test_3_class_results %>% 
+  conf_mat(truth = Class, Class_predicted) %>%
+  tidy %>%
+  separate(name, into = c("cell", "row", "column")) %>%
+  mutate(across(c(row, column), function(x) {as.integer(x) - 1})) %>%
+  select(-1)
 
+sensitivities_3_class <- test_results_long %>%
+  group_by(column) %>%
+  mutate(sensitivity = value / sum(value)) %>%
+  ungroup %>%
+  filter(row == column) %>%
+  select(class = row,
+         sensitivity)
+
+# go deeper with balanced data --------------------------------------------
+
+training_tbl <- here("data", "mitbih_train.csv") %>%
+  read_csv(col_names = F) %>%
+  mutate(X188 = as.factor(X188))
+
+test_tbl <- here("data", "mitbih_test.csv") %>%
+  read_csv(col_names = F) %>%
+  mutate(X188 = as.factor(X188))
+
+rec_both <- recipe(X188 ~ ., data = training_tbl) %>%
+  step_smote(X188, over_ratio = 0.483) %>%
+  step_downsample(X188) %>%
+  prep()
+
+training_tbl_b <- rec_both %>%
+  bake(new_data = NULL)
+
+# now shuffle data
+training_tbl_shuffled <- training_tbl_b %>%
+  slice(sample(1:nrow(training_tbl_b), nrow(training_tbl_b)))
+
+xtrain <- training_tbl_shuffled %>% 
+  select(-length(training_tbl)) %>%
+  as.matrix
+
+ytrain <- training_tbl_shuffled %>% 
+  select(length(training_tbl)) %>%
+  as.matrix 
+
+xtest <- test_tbl %>% 
+  select(-length(training_tbl)) %>%
+  as.matrix
+
+ytest <- test_tbl %>% 
+  select(length(training_tbl)) %>%
+  as.matrix 
+
+batch_size <- 128
+num_classes <- 5
+epochs <- 50
+
+input_shape <- c(187, 1)
+
+ytrain <- to_categorical(ytrain, num_classes)
+ytest <- to_categorical(ytest, num_classes)
+
+# define model structure 
+cnn_model_deeper <- keras_model_sequential() %>%
+  layer_conv_1d(filters = 32, kernel_size = c(5), activation = 'relu', input_shape = input_shape) %>% 
+  layer_dropout(rate = 0.25) %>% 
+  layer_conv_1d(filters = 64, kernel_size = c(5), activation = 'relu', input_shape = input_shape) %>% 
+  layer_max_pooling_1d(strides = 2, pool_size = c(5)) %>% 
+  layer_dropout(rate = 0.25) %>% 
+  layer_conv_1d(filters = 32, kernel_size = c(5), activation = 'relu', input_shape = input_shape) %>% 
+  layer_max_pooling_1d(strides = 2, pool_size = c(5)) %>% 
+  layer_dropout(rate = 0.25) %>% 
+  layer_flatten() %>% 
+  layer_dense(units = 32, activation = 'relu') %>% 
+  layer_dense(units = num_classes, activation = 'softmax')
+
+cnn_model_deeper
+
+# Compile model
+cnn_model_deeper %>% compile(
+  loss = loss_categorical_crossentropy,
+  optimizer = optimizer_adam(),
+  metrics = c('accuracy')
+)
+
+# set checkpoints callback ------------------------------------------------
+
+cp_callback <- callback_model_checkpoint(
+  filepath = "class_5_wider/checkpoint-{epoch:04d}.ckpt",
+  save_weights_only = TRUE,
+  verbose = 1
+)
+
+# Train model
+cnn_history_deeper <- cnn_model_deeper %>% fit(
+  xtrain, ytrain,
+  batch_size = batch_size,
+  epochs = epochs,
+  validation_split = 0.2,
+  callbacks = list(cp_callback)
+)
+
+# select best model -------------------------------------------------------
+
+# define model structure 
+cnn_model_best_deeper <- keras_model_sequential() %>%
+  layer_conv_1d(filters = 32, kernel_size = c(5), activation = 'relu', input_shape = input_shape) %>% 
+  layer_dropout(rate = 0.25) %>% 
+  layer_conv_1d(filters = 64, kernel_size = c(5), activation = 'relu', input_shape = input_shape) %>% 
+  layer_max_pooling_1d(strides = 2, pool_size = c(5)) %>% 
+  layer_dropout(rate = 0.25) %>% 
+  layer_conv_1d(filters = 32, kernel_size = c(5), activation = 'relu', input_shape = input_shape) %>% 
+  layer_max_pooling_1d(strides = 2, pool_size = c(5)) %>% 
+  layer_dropout(rate = 0.25) %>% 
+  layer_flatten() %>% 
+  layer_dense(units = 32, activation = 'relu') %>% 
+  layer_dense(units = num_classes, activation = 'softmax')
+
+cnn_model_best_deeper
+
+
+# Compile model
+cnn_model_best_deeper %>% compile(
+  loss = loss_categorical_crossentropy,
+  optimizer = optimizer_adam(),
+  metrics = c('accuracy')
+)
+
+which(cnn_history_deeper$metrics$val_loss == min(cnn_history_deeper$metrics$val_loss))
+
+load_model_weights_tf(cnn_model_best_deeper, "class_5_wider/checkpoint-0037.ckpt")
+
+cnn_model_best_deeper %>% evaluate(xtest, ytest)
+
+cnn_pred <- cnn_model_best_deeper %>% 
+  predict(xtest) %>%
+  k_argmax %>%
+  as.array
+
+head(cnn_pred, n=50)
+sum(cnn_pred != test_tbl$X188)
+
+
+# results -----------------------------------------------------------------
+
+test_deeper_class_results <- test_tbl %>%
+  select(Class = X188) %>%
+  bind_cols(
+    predict(cnn_model_best_deeper, xtest) %>%
+      k_argmax %>%
+      as.array,
+    predict(cnn_model_best_deeper, xtest)
+  ) %>%
+  rename(
+    Class_predicted = 2,
+    prob_0 = 3,
+    prob_1 = 4,
+    prob_2 = 5,
+    prob_3 = 6,
+    prob_4 = 7,
+  ) %>%
+  mutate(across(contains("Class"), as.factor))
+
+test_deeper_class_results
+
+test_deeper_class_results %>% 
+  accuracy(truth = Class, Class_predicted)
+
+test_deeper_class_results %>% 
+  conf_mat(truth = Class, Class_predicted)
+
+test_results_long <- test_deeper_class_results %>% 
+  conf_mat(truth = Class, Class_predicted) %>%
+  tidy %>%
+  separate(name, into = c("cell", "row", "column")) %>%
+  mutate(across(c(row, column), function(x) {as.integer(x) - 1})) %>%
+  select(-1)
+
+sensitivities_deeper <- test_results_long %>%
+  group_by(column) %>%
+  mutate(sensitivity = value / sum(value)) %>%
+  ungroup %>%
+  filter(row == column) %>%
+  select(class = row,
+         sensitivity)
