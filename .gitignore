@@ -1,3 +1,7 @@
+# data spell files
+.idea/*
+data/.idea/*
+
 # Mac files
 
 .DS_Store
