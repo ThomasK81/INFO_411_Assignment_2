@@ -145,8 +145,7 @@ test_results %>%
 # xgboost  -------------------------------------------------------
 
 bt_cls_spec <- 
-  boost_tree(trees = 15) %>% 
-  # This model can be used for classification or regression, so set mode
+  boost_tree(tree_depth = 8, trees = 20) %>% 
   set_mode("classification") %>% 
   set_engine("xgboost")
 bt_cls_spec
@@ -168,6 +167,41 @@ xboost_result %>%
 xboost_result %>% 
   conf_mat(truth = Class, .pred_class)
 
+# modify sampling ---------------------------------------------------------
+
+rec_both <- recipe(Class ~ ., data = training_tbl) %>%
+  step_smote(Class, over_ratio = 0.483) %>%
+  step_downsample(Class) %>%
+  prep()
+
+training_tbl_b <- rec_both %>%
+  bake(new_data = NULL)
+
+# now shuffle data
+training_tbl_shuffled <- training_tbl_b %>%
+  slice(sample(1:nrow(training_tbl_b), nrow(training_tbl_b)))
+
+bt_cls_spec_ou <- 
+  boost_tree(tree_depth = 10, trees = 25) %>% 
+  set_mode("classification") %>% 
+  set_engine("xgboost")
+
+set.seed(1)
+bt_cls_fit_ou <- bt_cls_spec_ou %>% fit(Class ~ ., data = training_tbl_shuffled)
+bt_cls_fit_ou
+
+xboost_result_ou <- test_tbl %>%
+  select(Class) %>%
+  bind_cols(
+    predict(bt_cls_fit_ou, test_tbl),
+    predict(bt_cls_fit_ou, test_tbl, type = "prob")
+  )
+
+xboost_result_ou %>%
+  accuracy(truth = Class, .pred_class)
+
+xboost_result_ou %>% 
+  conf_mat(truth = Class, .pred_class)
 
 # cnn ---------------------------------------------------------------------
 
