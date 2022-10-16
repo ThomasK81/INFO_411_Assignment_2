@@ -145,8 +145,7 @@ test_results %>%
 # xgboost  -------------------------------------------------------
 
 bt_cls_spec <- 
-  boost_tree(trees = 15) %>% 
-  # This model can be used for classification or regression, so set mode
+  boost_tree(tree_depth = 8, trees = 20) %>% 
   set_mode("classification") %>% 
   set_engine("xgboost")
 bt_cls_spec
@@ -168,6 +167,41 @@ xboost_result %>%
 xboost_result %>% 
   conf_mat(truth = Class, .pred_class)
 
+# modify sampling ---------------------------------------------------------
+
+rec_both <- recipe(Class ~ ., data = training_tbl) %>%
+  step_smote(Class, over_ratio = 0.483) %>%
+  step_downsample(Class) %>%
+  prep()
+
+training_tbl_b <- rec_both %>%
+  bake(new_data = NULL)
+
+# now shuffle data
+training_tbl_shuffled <- training_tbl_b %>%
+  slice(sample(1:nrow(training_tbl_b), nrow(training_tbl_b)))
+
+bt_cls_spec_ou <- 
+  boost_tree(tree_depth = 10, trees = 25) %>% 
+  set_mode("classification") %>% 
+  set_engine("xgboost")
+
+set.seed(1)
+bt_cls_fit_ou <- bt_cls_spec_ou %>% fit(Class ~ ., data = training_tbl_shuffled)
+bt_cls_fit_ou
+
+xboost_result_ou <- test_tbl %>%
+  select(Class) %>%
+  bind_cols(
+    predict(bt_cls_fit_ou, test_tbl),
+    predict(bt_cls_fit_ou, test_tbl, type = "prob")
+  )
+
+xboost_result_ou %>%
+  accuracy(truth = Class, .pred_class)
+
+xboost_result_ou %>% 
+  conf_mat(truth = Class, .pred_class)
 
 # cnn ---------------------------------------------------------------------
 
@@ -187,7 +221,7 @@ training_tbl %>%
   count(X188)
 
 # rebalance using SMOTE
-# bring the minority levels up to ~25000
+# bring the minority levels up to ~35000
 # 35000 / 72471 roughly 0.483
 
 rec <- recipe(X188 ~ ., data = training_tbl) %>%
@@ -872,3 +906,113 @@ sensitivities_deeper <- test_results_long %>%
   filter(row == column) %>%
   select(class = row,
          sensitivity)
+
+
+# have a look a secondary match -------------------------------------------
+
+test_deeper_class_results %>%
+  filter(Class_predicted == 0) %>%
+  filter(Class_predicted != Class) %>%
+  select(-prob_0, -Class_predicted) %>%
+  mutate(observation = row_number()) %>%
+  pivot_longer(cols = prob_1:prob_4, values_to = "prob") %>%
+  separate(name, into = c("delete", "secondary_class")) %>%
+  group_by(observation) %>%
+  filter(prob == max(prob)) %>%
+  ungroup %>%
+  mutate(secondary_match = Class == secondary_class) %>%
+  pull(secondary_match) %>%
+  mean
+
+test_deeper_class_results %>%
+  filter(Class_predicted == 0) %>%
+  filter(Class_predicted != Class) %>%
+  select(-prob_0, -Class_predicted) %>%
+  mutate(observation = row_number()) %>%
+  pivot_longer(cols = prob_1:prob_4, values_to = "prob") %>%
+  separate(name, into = c("delete", "secondary_class")) %>%
+  group_by(observation) %>%
+  filter(prob == max(prob)) %>%
+  ungroup %>%
+  mutate(secondary_match = Class == secondary_class) %>%
+  filter(Class == 1) %>%
+  pull(secondary_match) %>%
+  mean
+
+
+test_deeper_class_results %>%
+  filter(Class_predicted == 0) %>%
+  filter(Class_predicted != Class) %>%
+  select(-prob_0, -Class_predicted) %>%
+  mutate(observation = row_number()) %>%
+  pivot_longer(cols = prob_1:prob_4, values_to = "prob") %>%
+  separate(name, into = c("delete", "secondary_class")) %>%
+  group_by(observation) %>%
+  filter(prob == max(prob)) %>%
+  ungroup %>%
+  mutate(secondary_match = Class == secondary_class) %>%
+  filter(Class == 1) %>%
+  summarise(across(prob, .fns = list(min = min, max = max, mean = mean, sd = sd)))
+
+
+test_deeper_class_results %>%
+  filter(Class_predicted == 0) %>%
+  filter(Class_predicted != Class) %>%
+  select(-prob_0, -Class_predicted) %>%
+  mutate(observation = row_number()) %>%
+  pivot_longer(cols = prob_1:prob_4, values_to = "prob") %>%
+  separate(name, into = c("delete", "secondary_class")) %>%
+  group_by(observation) %>%
+  filter(prob == max(prob)) %>%
+  ungroup %>%
+  mutate(secondary_match = Class == secondary_class) %>%
+  filter(Class == 1) %>%
+  ggplot(aes("Probabilty Secondary Match", prob)) +
+  geom_violin(draw_quantiles = c(.25,.5,.75))
+
+
+# search for lambda -------------------------------------------------------
+test_deeper_class_results %>% 
+  filter(Class == 1, Class_predicted != 1) %>%
+  summarise(across(prob_1, .fns = list(min = min, max = max, mean = mean, sd = sd)))
+
+lambda <- 0.02
+
+test_deeper_class_results %>%
+  mutate(Class_predicted = case_when(
+    Class_predicted == 0 & prob_1 >= lambda ~ factor(1, levels = levels(Class_predicted)),
+    T ~ Class_predicted
+  )) %>%
+  conf_mat(truth = Class, Class_predicted)
+
+test_deeper_class_results %>%
+  mutate(Class_predicted = case_when(
+    Class_predicted == 0 & prob_1 >= lambda ~ factor(1, levels = levels(Class_predicted)),
+    T ~ Class_predicted
+  )) %>%
+  accuracy(truth = Class, Class_predicted)
+
+
+test_deeper_class_results %>%
+  mutate(Class_predicted = case_when(
+    Class_predicted == 0 & prob_1 >= lambda ~ factor(1, levels = levels(Class_predicted)),
+    T ~ Class_predicted
+  )) %>%
+  conf_mat(truth = Class, Class_predicted) %>%
+  tidy %>%
+  separate(name, into = c("cell", "row", "column")) %>%
+  mutate(across(c(row, column), function(x) {as.integer(x) - 1})) %>%
+  select(-1) %>%
+  group_by(column) %>%
+  mutate(sensitivity = value / sum(value)) %>%
+  ungroup %>%
+  filter(row == column) %>%
+  select(class = row,
+         sensitivity)
+
+
+# unlikely that the data set is divided into people
+
+47 * (87554 / 109446)
+
+
